@@ -53,6 +53,8 @@ class Document(HTMLParser):
         self.hidden = 0
         self.in_title = False
         self.anchor = None
+        self.main_parts, self.main_links = [], []
+        self.main_container, self.main_depth = None, 0
 
     def handle_starttag(self, tag, attrs):
         if tag in ('script', 'style', 'noscript', 'template', 'svg'):
@@ -60,6 +62,10 @@ class Document(HTMLParser):
         if self.hidden:
             return
         attrs = dict(attrs)
+        if self.main_depth and tag == self.main_container:
+            self.main_depth += 1
+        elif not self.main_depth and (tag in ('main', 'article') or attrs.get('role') == 'main'):
+            self.main_container, self.main_depth = tag, 1
         if tag == 'title':
             self.in_title = True
         if tag == 'a' and attrs.get('href'):
@@ -69,8 +75,14 @@ class Document(HTMLParser):
                 self.anchor = None
         if tag in ('p', 'br', 'div', 'h1', 'h2', 'li'):
             self.parts.append('\n')
+            if self.main_depth:
+                self.main_parts.append('\n')
 
     def handle_endtag(self, tag):
+        if not self.hidden and tag in ('p', 'div', 'h1', 'h2', 'li', 'article', 'main'):
+            self.parts.append('\n')
+            if self.main_depth:
+                self.main_parts.append('\n')
         if tag in ('script', 'style', 'noscript', 'template', 'svg') and self.hidden:
             self.hidden -= 1
         if tag == 'title':
@@ -79,12 +91,18 @@ class Document(HTMLParser):
             if len(self.links) < 100:
                 self.anchor['label'] = self.anchor['label'].strip()[:200]
                 self.links.append(self.anchor)
+                if self.main_depth:
+                    self.main_links.append(self.anchor)
             self.anchor = None
+        if self.main_depth and tag == self.main_container:
+            self.main_depth -= 1
 
     def handle_data(self, text):
         if self.hidden:
             return
         self.parts.append(text)
+        if self.main_depth:
+            self.main_parts.append(text)
         if self.in_title:
             self.title.append(text)
         if self.anchor:
@@ -176,7 +194,7 @@ class Reader:
             doc = Document(url)
             if kind == 'text/html':
                 doc.feed(text)
-                text = '\n'.join(' '.join(line.split()) for line in ''.join(doc.parts).splitlines() if line.strip())
+                text = '\n'.join(' '.join(line.split()) for line in ''.join(doc.main_parts or doc.parts).splitlines() if line.strip())
             return {'url': url, 'title': ''.join(doc.title).strip()[:200] or url,
-                    'text': text[:40000], 'links': doc.links}
+                    'text': text[:40000], 'links': doc.main_links or doc.links}
         raise ValueError('Too many redirects')
