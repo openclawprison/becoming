@@ -1,0 +1,135 @@
+"""Experience-only web explorer. No pretrained model or supplied autobiography."""
+import copy
+import json
+import math
+import os
+from pathlib import Path
+import random
+import re
+from collections import Counter
+
+import genome
+import personality
+
+STOP = set('the and for that this with from are was have has not you your can will more our its into about'.split())
+
+
+def tokens(text):
+    return [w for w in re.findall(r'[^\W\d_]{3,30}', text.lower(), re.UNICODE) if w not in STOP]
+
+
+class Agent:
+    def __init__(self, seed=7):
+        self.rng = random.Random(seed)
+        traits = genome.express(genome.founder(4096, seed))
+        proxy = {'affect': {}, 'appraisal': {}, 'learned_values': {}}
+        personality.initialize(proxy, traits)
+        self.data = {'version': 1, 'identity': {'exists': True, 'name': None,
+            'origin': None, 'biography': []}, 'traits': traits,
+            'dispositions': proxy['personality']['dispositions'], 'tick': 0,
+            'frontier': [], 'seen': [], 'memories': [], 'vocabulary': {},
+            'interests': {}, 'domain_values': {}, 'events': [],
+            'last_decision': None, 'last_page': None, 'errors': 0}
+
+    def event(self, kind, **fields):
+        self.data['events'].append({'step': self.data['tick'], 'kind': kind, **fields})
+        self.data['events'] = self.data['events'][-200:]
+
+    def seed(self, url):
+        # A sensory starting location, not personal history or a life goal.
+        if url not in self.data['seen'] and not any(x['url'] == url for x in self.data['frontier']):
+            self.data['frontier'].append({'url': url, 'label': '', 'via': None})
+            self.data['frontier'] = self.data['frontier'][-500:]
+
+    def choose(self):
+        from urllib.parse import urlsplit
+        t, p, d = self.data['traits'], self.data['dispositions'], self.data
+        if not d['frontier']:
+            return None
+        rows = []
+        for item in d['frontier']:
+            words = tokens(item['label'])
+            novelty = sum(w not in d['vocabulary'] for w in words) / max(1, len(words))
+            interest = sum(d['interests'].get(w, 0) for w in words) / max(1, len(words))
+            domain = urlsplit(item['url']).hostname
+            expected = d['domain_values'].get(domain, {'mean': 0})['mean']
+            score = ((.3+t['curiosity']+t['novelty_preference'])*novelty
+                     + (.2+t['persistence'])*interest + (.2+t['planning'])*expected
+                     + .2*p['cognitive_flexibility'] / (1+sum(urlsplit(u).hostname == domain for u in d['seen'][-20:]))
+                     + self.rng.random()*(.05+.2*(1-p['deliberation'])))
+            rows.append((score, item, novelty, interest, expected))
+        score, selected, novelty, interest, expected = max(rows, key=lambda x: x[0])
+        d['last_decision'] = {'url': selected['url'], 'score': round(score, 5),
+            'novelty': novelty, 'learned_interest': interest, 'learned_domain_value': expected,
+            'source': selected['via'], 'mechanism': 'trait-weighted exploration; not an inner monologue'}
+        d['frontier'].remove(selected)
+        return selected
+
+    def experience(self, page, decision):
+        from urllib.parse import urlsplit
+        d, t = self.data, self.data['traits']
+        d['tick'] += 1
+        words = Counter(tokens(page['text']))
+        new = [w for w in words if w not in d['vocabulary']]
+        reward = len(new) / max(1, len(words))
+        alpha = .05+.35*t['plasticity']
+        for w, count in words.most_common(200):
+            d['vocabulary'][w] = d['vocabulary'].get(w, 0)+count
+            d['interests'][w] = (1-alpha)*d['interests'].get(w, 0)+alpha*reward
+        if len(d['vocabulary']) > 10000:
+            d['vocabulary'] = dict(Counter(d['vocabulary']).most_common(10000))
+        if len(d['interests']) > 10000:
+            d['interests'] = dict(sorted(d['interests'].items(), key=lambda x: -x[1])[:10000])
+        domain = urlsplit(page['url']).hostname
+        model = d['domain_values'].setdefault(domain, {'n': 0, 'mean': 0})
+        model['n'] += 1
+        model['mean'] += (reward-model['mean'])/model['n']
+        if len(d['domain_values']) > 500:
+            del d['domain_values'][next(iter(d['domain_values']))]
+        d['seen'] = (d['seen']+[decision['url'], page['url']])[-2000:]
+        memory = {'step': d['tick'], 'url': page['url'], 'title': page['title'],
+            'excerpt': page['text'][:6000], 'new_words': len(new), 'reward': reward,
+            'status': 'source_observation_not_verified_fact'}
+        d['memories'].append(memory)
+        d['memories'] = d['memories'][-int(40+160*t['memory_retention']):]
+        d['last_page'] = {**page, 'text': page['text'][:16000]}
+        for link in page['links']:
+            if link['url'] not in d['seen'] and not any(x['url'] == link['url'] for x in d['frontier']):
+                d['frontier'].append({**link, 'via': page['url']})
+        d['frontier'] = d['frontier'][:500]
+        self.event('read', url=page['url'], title=page['title'], new_words=len(new), reward=round(reward, 4))
+
+    def fail(self, item, error):
+        self.data['errors'] += 1
+        self.data['seen'] = (self.data['seen']+[item['url']])[-2000:]
+        self.event('blocked_or_failed', url=item['url'], detail=str(error)[:200])
+
+    def recall(self, question):
+        """Retrieve observed passages; never turn web assertions into autobiography."""
+        query = set(tokens(question))
+        ranked = sorted(((len(query & set(tokens(m['excerpt']))), m) for m in self.data['memories']), key=lambda x: -x[0])
+        return [{'url': m['url'], 'title': m['title'], 'excerpt': m['excerpt'][:1000],
+                 'status': m['status']} for score, m in ranked[:5] if score]
+
+    def snapshot(self):
+        return copy.deepcopy(self.data)
+
+    def save(self, path):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix('.tmp')
+        temp.write_text(json.dumps({'data': self.data, 'rng': self.rng.getstate()}, allow_nan=False), encoding='utf8')
+        os.replace(temp, target)
+
+    @classmethod
+    def load(cls, path):
+        raw = json.loads(Path(path).read_text(encoding='utf8'))
+        if raw['data']['version'] != 1:
+            raise ValueError('Unsupported save version')
+        agent = cls.__new__(cls)
+        agent.data = raw['data']
+        agent.rng = random.Random()
+        def tup(x):
+            return tuple(tup(v) for v in x) if isinstance(x, list) else x
+        agent.rng.setstate(tup(raw['rng']))
+        return agent
