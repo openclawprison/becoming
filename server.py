@@ -8,13 +8,18 @@ from urllib.parse import urlsplit
 
 from agent import Agent
 from web_reader import Reader, normalize
+from cognition import LocalMind
 
 
 class Simulation:
-    def __init__(self, path, seed=7):
+    def __init__(self, path, seed=7, model='gemma3:1b'):
         self.path = Path(path)
         self.agent = Agent.load(path) if self.path.exists() else Agent(seed)
         self.reader = Reader()
+        self.mind = LocalMind(model) if model else None
+        self.reflect_requested = False
+        self.agent.data['cognition'].update({'mode': 'local_language_model' if model else 'word_learning_only',
+            'model': model or None, 'pretrained_knowledge': bool(model)})
         self.lock = threading.RLock()
         self.running = False
         self.busy = False
@@ -27,25 +32,51 @@ class Simulation:
     def worker(self):
         while not self.stop.wait(2):
             with self.lock:
-                if not self.running:
+                reflect_only = self.reflect_requested
+                self.reflect_requested = False
+                if not self.running and not reflect_only:
                     continue
-                item = self.agent.choose()
-                if item is None:
+                page = self.agent.data['last_page'] if reflect_only else None
+                item = None if reflect_only else self.agent.choose()
+                if not reflect_only and item is None:
                     self.running = False
                     self.status = 'No unvisited links remain. Add another starting URL.'
                     self.agent.save(self.path)
                     continue
                 self.busy = True
-                self.status = 'Reading '+item['url']
+                self.status = 'Reflecting on the last page' if reflect_only else 'Reading '+item['url']
             # No lock during network requests: pause/status remain responsive.
             try:
-                page = self.reader.fetch(item['url'])
-                with self.lock:
-                    self.agent.experience(page, item)
-                    self.status = 'Observed '+page['url']
+                if not reflect_only:
+                    page = self.reader.fetch(item['url'])
+                    with self.lock:
+                        self.agent.experience(page, item)
+                        self.agent.save(self.path)
+                        self.status = 'Observed '+page['url']
+                if self.mind and page:
+                    with self.lock:
+                        step = self.agent.data['tick']
+                        already = step in self.agent.data['reflected_steps']
+                        history, interests = self.agent.cognitive_context()
+                        traits = self.agent.data['traits'].copy()
+                        self.status = 'Reading for meaning with local '+self.mind.model
+                    if not already:
+                        try:
+                            result = self.mind.reflect(page, history, interests, traits)
+                            with self.lock:
+                                self.agent.integrate(result, page, step)
+                                self.status = 'Reflection recorded: '+page['title']
+                        except Exception as error:
+                            with self.lock:
+                                self.agent.data['cognition']['error'] = str(error)[:200]
+                                self.agent.event('reflection_failed', detail=str(error)[:200])
+                                self.status = 'Page retained; comprehension unavailable: '+str(error)[:160]
+                                # Avoid repeated heavy failures; explicit resume retries next page.
+                                self.running = False
             except Exception as error:
                 with self.lock:
-                    self.agent.fail(item, error)
+                    if item:
+                        self.agent.fail(item, error)
                     self.status = str(error)[:200]
             finally:
                 with self.lock:
@@ -125,6 +156,17 @@ def handler(sim):
                             raise ValueError('question must be text, at most 1000 characters')
                         self.reply(200, {'passages': sim.agent.recall(body['question'])})
                         return
+                    elif path == '/api/reflect':
+                        if body or not sim.mind:
+                            raise ValueError('Local model required; no arguments accepted')
+                        if sim.busy or sim.reflect_requested:
+                            raise ValueError('An experience is already in progress')
+                        if not sim.agent.data['last_page']:
+                            raise ValueError('Read a page first')
+                        if sim.agent.data['tick'] in sim.agent.data['reflected_steps']:
+                            raise ValueError('This page already has a saved reflection')
+                        sim.reflect_requested = True
+                        sim.status = 'Reflection queued'
                     elif path == '/api/save':
                         if body:
                             raise ValueError('No save arguments')
@@ -143,8 +185,10 @@ def main():
     parser.add_argument('--port', type=int, default=8890)
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--save', default='data/becoming.json')
+    parser.add_argument('--model', default='gemma3:1b', help='Already-installed local Ollama model')
+    parser.add_argument('--no-model', action='store_true', help='Use the limited word learner only')
     args = parser.parse_args()
-    sim = Simulation(args.save, args.seed)
+    sim = Simulation(args.save, args.seed, model=None if args.no_model else args.model)
     server = ThreadingHTTPServer(('127.0.0.1', args.port), handler(sim))
     worker = threading.Thread(target=sim.worker, daemon=True)
     worker.start()
@@ -155,7 +199,7 @@ def main():
         pass
     finally:
         sim.stop.set()
-        worker.join(60)
+        worker.join(310)
         with sim.lock:
             sim.agent.save(sim.path)
         server.server_close()
