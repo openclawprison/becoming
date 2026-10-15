@@ -1,4 +1,4 @@
-"""Experience-only web explorer. No pretrained model or supplied autobiography."""
+"""Experience-grounded explorer with optional local language comprehension."""
 import copy
 import json
 import math
@@ -30,6 +30,95 @@ class Agent:
             'frontier': [], 'seen': [], 'memories': [], 'vocabulary': {},
             'interests': {}, 'domain_values': {}, 'events': [],
             'last_decision': None, 'last_page': None, 'errors': 0}
+        self.upgrade()
+
+    def upgrade(self):
+        d = self.data
+        d.setdefault('cognition', {'mode': 'word_learning_only', 'model': None,
+            'pretrained_knowledge': False, 'completed': 0, 'error': None})
+        for name, default in [('journal', []), ('beliefs', []), ('questions', []),
+                              ('semantic_interests', {}), ('link_intentions', {}), ('reflected_steps', [])]:
+            d.setdefault(name, copy.deepcopy(default))
+        d.setdefault('mental_state', {'curiosity': .5, 'satisfaction': 0., 'uncertainty': 1.,
+                                     'fatigue': 0., 'status': 'engineered_motivational_proxies'})
+        d.setdefault('self_description', {'text': f"I have recorded {d['tick']} page experiences; no semantic reflections yet.",
+            'basis': 'recorded_behavior_only', 'observed_interests': [], 'revisions': 0})
+
+    def cognitive_context(self):
+        return ([{'step': j['step'], 'summary': j['summary'], 'url': j['url']} for j in self.data['journal'][-3:]],
+                sorted(self.data['semantic_interests'].items(), key=lambda x: -x[1]['strength'])[:8])
+
+    def integrate(self, result, page, step):
+        """Only validated results enter memory; a model cannot patch identity/state."""
+        from urllib.parse import urlsplit
+        d = self.data
+        if step in d['reflected_steps']:
+            return False
+        # Validate again at this boundary, including for injected/custom providers.
+        from cognition import validate
+        candidates = page['links'][:35]
+        raw = {k: result[k] for k in ('summary', 'claims', 'interests', 'questions', 'reflection', 'uncertainty')}
+        raw['next_links'] = []
+        checked = validate(raw, page, candidates)
+        allowed = {x['url'] for x in candidates}
+        next_links = [x for x in result.get('next_links', []) if x.get('url') in allowed
+                      and isinstance(x.get('reason'), str) and len(x['reason']) <= 200]
+        if not checked['claims']:
+            raise ValueError('No source-grounded claims survived validation')
+        d['reflected_steps'] = (d['reflected_steps']+[step])[-2000:]
+        evidence_ids = []
+        for i, claim in enumerate(checked['claims']):
+            evidence_id = f'{step}:{i}'
+            evidence_ids.append(evidence_id)
+            matches = [b for b in d['beliefs'] if b['statement'].casefold() == claim['statement'].casefold()]
+            evidence = {'id': evidence_id, 'step': step, 'url': page['url'], 'quote': claim['quote']}
+            if matches:
+                b = matches[0]
+                if page['url'] not in [s['url'] for s in b['sources']]:
+                    b['sources'] = (b['sources']+[evidence])[-5:]
+                b['independent_domains'] = len({urlsplit(s['url']).hostname for s in b['sources']})
+            else:
+                d['beliefs'].append({'statement': claim['statement'], 'sources': [evidence],
+                    'independent_domains': 1, 'status': 'source_claim_not_verified_fact'})
+        d['beliefs'] = d['beliefs'][-300:]
+        alpha = .1+.3*d['traits']['plasticity']
+        for interest in d['semantic_interests'].values():
+            interest['strength'] *= .98
+        for item in checked['interests']:
+            topic = item['topic']
+            previous = d['semantic_interests'].get(topic, {'strength': .2, 'encounters': 0})
+            d['semantic_interests'][topic] = {'strength': (1-alpha)*previous['strength']+alpha*item['strength'],
+                'encounters': previous['encounters']+1, 'reason': item['reason'],
+                'quote': item['quote'], 'url': page['url'], 'last_step': step}
+        d['semantic_interests'] = dict(sorted(d['semantic_interests'].items(), key=lambda x: -x[1]['strength'])[:80])
+        for question in checked['questions']:
+            if not any(q['text'] == question for q in d['questions']):
+                d['questions'].append({'text': question, 'step': step, 'source': page['url'], 'status': 'open'})
+        d['questions'] = d['questions'][-30:]
+        for i, link in enumerate(next_links):
+            d['link_intentions'][link['url']] = {'reason': link['reason'], 'source': page['url'],
+                                                 'step': step, 'weight': 1/(1+i)}
+        d['link_intentions'] = dict(list(d['link_intentions'].items())[-150:])
+        d['journal'].append({'step': step, 'url': page['url'], 'summary': checked['summary'],
+            'reflection': checked['reflection'], 'uncertainty': checked['uncertainty'],
+            'evidence_ids': evidence_ids, 'evidence': checked['claims'],
+            'model': result.get('model'), 'status': 'generated_public_reflection_not_subjective_thought'})
+        d['journal'] = d['journal'][-80:]
+        d['cognition'].update({'completed': d['cognition']['completed']+1, 'error': None})
+        m = d['mental_state']
+        m['satisfaction'] = min(1., len(checked['claims'])/4)
+        m['uncertainty'] = .7 if checked['uncertainty'] else .4
+        m['curiosity'] = min(1., .3+.15*len(checked['questions'])+.2*d['traits']['curiosity'])
+        m['fatigue'] = min(1., m['fatigue']+.03)
+        interests = sorted(d['semantic_interests'], key=lambda k: -d['semantic_interests'][k]['strength'])[:4]
+        old = d['self_description']
+        d['self_description'] = {'text': f"I have recorded {d['tick']} page experiences and reflected on {d['cognition']['completed']}. "
+            + ('My current reading interests include '+', '.join(interests)+'. ' if interests else '')
+            + 'These preferences are provisional. I have no recorded human biography or established account of my origin.',
+            'basis': 'recorded_behavior_only', 'observed_interests': interests, 'revisions': old['revisions']+1,
+            'evidence_steps': [j['step'] for j in d['journal'][-8:]]}
+        self.event('reflected', url=page['url'], claims=len(checked['claims']), topics=interests)
+        return True
 
     def event(self, kind, **fields):
         self.data['events'].append({'step': self.data['tick'], 'kind': kind, **fields})
@@ -53,15 +142,21 @@ class Agent:
             interest = sum(d['interests'].get(w, 0) for w in words) / max(1, len(words))
             domain = urlsplit(item['url']).hostname
             expected = d['domain_values'].get(domain, {'mean': 0})['mean']
-            score = ((.3+t['curiosity']+t['novelty_preference'])*novelty
+            intention = d['link_intentions'].get(item['url'])
+            semantic = sum(v['strength']*len(set(tokens(topic)) & set(words))/max(1, len(tokens(topic)))
+                           for topic, v in d['semantic_interests'].items())
+            reflective_bonus = (1.2*intention['weight'] if intention else 0)+.4*semantic
+            motivation = .5+.5*d['mental_state']['curiosity']
+            score = ((.3+t['curiosity']*motivation+t['novelty_preference'])*novelty
                      + (.2+t['persistence'])*interest + (.2+t['planning'])*expected
                      + .2*p['cognitive_flexibility'] / (1+sum(urlsplit(u).hostname == domain for u in d['seen'][-20:]))
-                     + self.rng.random()*(.05+.2*(1-p['deliberation'])))
+                     + reflective_bonus + self.rng.random()*(.05+.2*(1-p['deliberation'])))
             rows.append((score, item, novelty, interest, expected))
         score, selected, novelty, interest, expected = max(rows, key=lambda x: x[0])
         d['last_decision'] = {'url': selected['url'], 'score': round(score, 5),
             'novelty': novelty, 'learned_interest': interest, 'learned_domain_value': expected,
-            'source': selected['via'], 'mechanism': 'trait-weighted exploration; not an inner monologue'}
+            'source': selected['via'], 'reflection_intention': d['link_intentions'].get(selected['url']),
+            'mechanism': 'traits, novelty, semantic interests and grounded reflection; not an inner monologue'}
         d['frontier'].remove(selected)
         return selected
 
@@ -128,6 +223,7 @@ class Agent:
             raise ValueError('Unsupported save version')
         agent = cls.__new__(cls)
         agent.data = raw['data']
+        agent.upgrade()
         agent.rng = random.Random()
         def tup(x):
             return tuple(tup(v) for v in x) if isinstance(x, list) else x
