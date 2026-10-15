@@ -188,10 +188,14 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(self.sim.running)
 
     def test_seed_and_recall(self):
+        self.assertEqual(self.request('/api/reflect', {})[0], 400)
         status, _ = self.request('/api/seed', {'url': 'https://example.com/'})
         self.assertEqual(status, 200)
         self.assertEqual(len(self.sim.agent.data['frontier']), 1)
         self.assertEqual(self.request('/api/recall', {'question': 'forests'})[1], {'passages': []})
+        self.sim.agent.experience(page(), {'url': 'https://example.com/'})
+        self.sim.agent.data['reflected_steps'].append(1)
+        self.assertEqual(self.request('/api/reflect', {})[0], 400)
 
 
 if __name__ == '__main__':
